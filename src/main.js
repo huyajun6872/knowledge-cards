@@ -5,6 +5,12 @@ let currentCategory = 'animal'
 let currentIndex = 0
 let filteredCards = []
 
+// 语音引擎：优先 MiMo 云端 TTS，失败回退浏览器原生
+// 注意：前端直连会把 key 暴露给浏览器，仅适合本地/受信环境，生产请改用后端代理
+const MIMO_API_KEY = 'sk-ckueazcziqx8sibt5aoe6q1v2ch980a90qa94nxrtlmxl46a'
+
+let cloudBusy = false
+
 function init() {
   renderTabs()
   filterAndRender()
@@ -48,12 +54,12 @@ function renderCard() {
           ? 'hidden-left'
           : 'hidden-right'
     h += `<div class="card card-${card.category} ${cls}">`
+    h += `<button class="card-read-btn" data-index="${i}" title="朗读">🔊</button>`
     h += `<span class="card-tag tag-${card.category}">${card.categoryName}</span>`
     h += `<div class="card-emoji">${card.emoji}</div>`
     h += `<div class="card-title">${card.title}</div>`
     h += `<div class="card-question">${card.question}</div>`
     h += `<div class="card-answer">${card.answer}</div>`
-    h += `<button class="btn-read" data-index="${i}">🔊 读一读</button>`
     h += `<div class="card-number">${card.number} / ${cards.length}</div>`
     h += `</div>`
   }
@@ -95,6 +101,101 @@ function next() {
   }
 }
 
+// ---------- 朗读 ----------
+function pickVoices() {
+  if (!('speechSynthesis' in window)) return []
+  return window.speechSynthesis.getVoices() || []
+}
+
+function zhVoice() {
+  const vs = pickVoices()
+  return vs.find((v) => /zh|cmn|Chinese/i.test(v.lang || v.name)) || null
+}
+
+function speakLocal(text, lang) {
+  if (!('speechSynthesis' in window)) {
+    alert('当前浏览器不支持语音朗读')
+    return
+  }
+  window.speechSynthesis.cancel()
+  const u = new SpeechSynthesisUtterance(text)
+  u.lang = lang
+  const v = lang === 'zh-CN' ? zhVoice() : null
+  if (v) u.voice = v
+  u.rate = 0.9
+  window.speechSynthesis.speak(u)
+}
+
+// MiMo TTS 直连：调用小米 MiMo 接口，返回 Base64 音频后用 <audio> 播放
+async function speakMiMo(text, btn) {
+  if (cloudBusy) return
+  const apiKey = MIMO_API_KEY
+  const voice = 'mimo_default'
+  const statusEl = document.getElementById('ttsStatus')
+  const audioPlayer = document.getElementById('audioPlayer')
+
+  cloudBusy = true
+  if (btn) {
+    btn.textContent = '⏳'
+    btn.disabled = true
+  }
+  statusEl.textContent = '⏳ 正在请求语音合成...'
+  audioPlayer.style.display = 'none'
+
+  const payload = {
+    model: 'mimo-v2.5-tts',
+    messages: [
+      { role: 'user', content: '用自然清晰的语气朗读' },
+      { role: 'assistant', content: text },
+    ],
+    audio: { voice, format: 'mp3' },
+  }
+
+  try {
+    const resp = await fetch('https://api.xiaomimimo.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'api-key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}))
+      throw new Error(`请求失败 (${resp.status}): ${err.message || resp.statusText}`)
+    }
+    const result = await resp.json()
+    const b64 = result.choices?.[0]?.message?.audio?.data
+    if (!b64) throw new Error('响应中没有音频数据')
+
+    const byteChars = atob(b64)
+    const bytes = new Uint8Array(byteChars.length)
+    for (let i = 0; i < byteChars.length; i++) bytes[i] = byteChars.charCodeAt(i)
+    const audioBlob = new Blob([bytes], { type: 'audio/mp3' })
+    const audioUrl = URL.createObjectURL(audioBlob)
+
+    audioPlayer.src = audioUrl
+    audioPlayer.style.display = 'block'
+    await audioPlayer.play()
+    statusEl.textContent = '✅ 语音合成成功，正在播放'
+  } catch (e) {
+    console.warn('[MiMo] 调用失败，回退浏览器原生朗读:', e)
+    statusEl.textContent = `⚠️ MiMo 失败，使用本地朗读：${e.message}`
+    speakLocal(text, 'zh-CN')
+  } finally {
+    cloudBusy = false
+    if (btn) {
+      btn.textContent = '🔊'
+      btn.disabled = false
+    }
+  }
+}
+
+function readIndex(i) {
+  const c = filteredCards[i]
+  if (!c) return
+  const text = `${c.title}。${c.question} ${c.answer}`.replace(/<[^>]+>/g, ' ')
+  const btn = document.querySelector(`.card-read-btn[data-index="${i}"]`)
+  speakMiMo(text, btn)
+}
+
 document.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowLeft') prev()
   else if (e.key === 'ArrowRight') next()
@@ -113,61 +214,8 @@ document.addEventListener('touchend', (e) => {
 document.getElementById('prevBtn').addEventListener('click', prev)
 document.getElementById('nextBtn').addEventListener('click', next)
 document.getElementById('cardContainer').addEventListener('click', (e) => {
-  const btn = e.target.closest('.btn-read')
-  if (btn) readCard(filteredCards[Number(btn.dataset.index)])
+  const rb = e.target.closest('.card-read-btn')
+  if (rb) readIndex(Number(rb.dataset.index))
 })
-
-// 选择本机最自然的中文嗓音：优先 Apple 的 Ting-Ting / Mei-Jia（Mac 上最自然），
-// 其次任意 zh-CN / zh 嗓音，最后退回到默认嗓音。
-let preferredVoice = null
-function pickVoice() {
-  const voices = window.speechSynthesis.getVoices()
-  if (!voices.length) return null
-  const zh = voices.filter((v) => /zh|cmn|Chinese/i.test(v.lang))
-  const ranked = [
-    (v) => /Ting-Ting|Mei-Jia|Yu-Shu|Sin-Ji/i.test(v.name),
-    (v) => /Google 普通话|Google Chinese/i.test(v.name),
-    (v) => /Microsoft.*Chinese|Microsoft.*zh/i.test(v.name),
-    (v) => true,
-  ]
-  for (const pred of ranked) {
-    const found = zh.find(pred)
-    if (found) return found
-  }
-  return zh[0] || voices[0]
-}
-function ensureVoice() {
-  if (preferredVoice) return preferredVoice
-  preferredVoice = pickVoice()
-  return preferredVoice
-}
-
-function readCard(card) {
-  if (!card) return
-  if (!('speechSynthesis' in window)) {
-    alert('当前浏览器不支持语音朗读功能 😢')
-    return
-  }
-  window.speechSynthesis.cancel()
-  const stripTags = (s) => s.replace(/<[^>]+>/g, '')
-  const stripEmoji = (s) =>
-    s.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{FE0F}\u{20E3}\u{1F1E6}-\u{1F1FF}]/gu, '')
-  const text = `${card.title}。${card.question} ${stripEmoji(stripTags(card.answer))}`
-  const utter = new SpeechSynthesisUtterance(text)
-  utter.lang = 'zh-CN'
-  utter.rate = 0.9
-  utter.pitch = 1.05
-  const voice = ensureVoice()
-  if (voice) utter.voice = voice
-  // 首次列表可能尚未加载完成，加载完再读一次
-  if (!voice && 'onvoiceschanged' in window.speechSynthesis) {
-    window.speechSynthesis.onvoiceschanged = () => {
-      utter.voice = ensureVoice()
-      window.speechSynthesis.speak(utter)
-    }
-    return
-  }
-  window.speechSynthesis.speak(utter)
-}
 
 init()

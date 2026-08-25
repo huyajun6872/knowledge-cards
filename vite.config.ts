@@ -5,6 +5,13 @@ export default defineConfig({
   base: './',
   server: {
     host: true,
-    port: 5173
-  }
+    port: 5173,
+    // 开发时将 /api/tts 代理到本地 MiMo 代理服务（server/tts-proxy.mjs）
+    proxy: {
+      '/api/tts': {
+        target: 'http://localhost:8787',
+        changeOrigin: true,
+      },
+    },
+  },
 })
